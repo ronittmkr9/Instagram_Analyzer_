@@ -1,4 +1,3 @@
-import os
 import shutil
 from pathlib import Path
 
@@ -13,33 +12,43 @@ def collect_jpgs(source_folder="output", destination_folder="output/_______all_j
 
     destination.mkdir(parents=True, exist_ok=True)
 
-    moved = 0
-    skipped = 0
+    copied = 0
+    renamed = 0
 
-    # Walk through all subfolders
+    # Walk through all jpg files
     for jpg_file in source.rglob("*.jpg"):
-        # Skip files already in the destination folder
+
+        # Only process actual files
+        if not jpg_file.is_file():
+            continue
+
+        # Skip destination folder itself
         if destination in jpg_file.parents:
             continue
 
         target = destination / jpg_file.name
 
-        # Handle duplicates by appending a counter
+        # Handle duplicate names
         if target.exists():
             stem = jpg_file.stem
             suffix = jpg_file.suffix
             counter = 1
+
             while target.exists():
                 target = destination / f"{stem}_{counter}{suffix}"
                 counter += 1
+
             print(f"Duplicate found — saving as: {target.name}")
-            skipped += 1
+            renamed += 1
 
-        shutil.copy2(str(jpg_file), str(target))
+        shutil.copy2(jpg_file, target)
         print(f"Copied: {jpg_file} -> {target}")
-        moved += 1
+        copied += 1
 
-    print(f"\nDone! {moved} file(s) moved to '{destination_folder}'. {skipped} duplicate(s) renamed.")
+    print(
+        f"\nDone! {copied} file(s) copied to '{destination_folder}'. "
+        f"{renamed} duplicate(s) renamed."
+    )
 
 
 if __name__ == "__main__":

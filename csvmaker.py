@@ -78,13 +78,13 @@ def create_csv_from_analyzed_json_efficiently(analyzed_json_path: str, output_cs
     print(f"{Fore.CYAN}Starting enhanced CSV conversion with location data...{Style.RESET_ALL}")
 
     try:
-        # Step 1: Sort by engagement rate
-        print(f"{Fore.CYAN}Sorting creators by engagement rate...{Style.RESET_ALL}")
+        # Step 1: Stream _data.json via ijson and sort by engagement rate
+        print(f"{Fore.CYAN}Reading JSON and sorting by engagement rate...{Style.RESET_ALL}")
         creators_to_sort = []
         with open(analyzed_json_path, 'rb') as json_file:
             creators = ijson.items(json_file, 'creators.item')
             for creator in creators:
-                engagement_rate = creator.get('average_engagement_rate', 0)
+                engagement_rate = creator.get('average_engagement_rate', 0) or 0
                 creators_to_sort.append({'engagement_rate': engagement_rate, 'creator_data': creator})
 
         creators_to_sort.sort(key=lambda x: x['engagement_rate'], reverse=True)
@@ -100,7 +100,7 @@ def create_csv_from_analyzed_json_efficiently(analyzed_json_path: str, output_cs
         print(f"{Fore.CYAN}Writing data to CSV...{Style.RESET_ALL}")
 
         headers = [
-            "email", "primary_social_link", "username", "first_name", "last_name", "creator_type",
+            "email", "primary_social_link", "username", "pk", "full_name", "first_name", "last_name", "creator_type",
             "address_city", "address_state", "address_country", "address_zip",
             "latitude", "longitude",
             "posts_with_location", "total_posts_scraped",
@@ -109,7 +109,10 @@ def create_csv_from_analyzed_json_efficiently(analyzed_json_path: str, output_cs
             "age_group", "age", "gender", "phone_number", "profile_picture",
             "tiktok_link", "youtube_link", "x_link", "linktree_link", "other_social_media",
             "business_category",
-            "bio_data", "last_updated", "source",
+            "bio_data", "combined_hashtags", "combined_mentions",
+            "combined_hashtags_count", "combined_mentions_count",
+            "hashtags_last_90_days", "mentions_last_90_days",
+            "last_updated", "source",
             "total_collaborations_in_recent_25_posts", "ugc_examples",
             "latest_post_link", "latest_post_date",
             "scraped_date", "analyzed_date"
@@ -135,22 +138,24 @@ def create_csv_from_analyzed_json_efficiently(analyzed_json_path: str, output_cs
                     total_users += 1
 
                     username = creator.get('username', '')
-                    first_name_raw = creator.get('first_name', '')
-                    processed_first_name = process_first_name(first_name_raw)
-                    # last_name: split full_name, take everything after first word, clean same way
-                    full_name_raw = creator.get('full_name', '') or ''
-                    full_name_parts = full_name_raw.strip().split(None, 1)
-                    last_name_raw = full_name_parts[1] if len(full_name_parts) > 1 else ''
-                    processed_last_name = re.sub(r'\b(\w)', lambda m: m.group(1).upper(), re.sub(r'[^a-zA-Z\s]', '', last_name_raw).strip())
+                    user_pk = creator.get('user_pk') or creator.get('pk', '')
+                    full_name = creator.get('full_name', '')
+                    # Trust first_name / last_name computed by analyze.py (SSA-validated).
+                    # analyze.py already puts username (cleaned) in first_name when no real
+                    # name is found, and leaves last_name None/empty in that case.
+                    processed_first_name = process_first_name(creator.get('first_name', '') or '')
+                    processed_last_name  = process_first_name(creator.get('last_name',  '') or '')
                     email = creator.get('email', '')
 
-                    # Location — from bio (same source as ai_analyzed)
-                    address_city    = creator.get('address_city', '')
-                    address_state   = creator.get('address_state', '')
-                    address_country = creator.get('address_country', '')
-                    address_zip     = creator.get('address_zip', '')
-                    latitude        = creator.get('latitude', '')
-                    longitude       = creator.get('longitude', '')
+                    # Location — csv first, then bio fallback, then blank
+                    csv_loc = creator.get('creator_location_from_csv') or {}
+                    bio_loc = creator.get('creator_location_from_bio') or {}
+                    address_city    = csv_loc.get('city')      or bio_loc.get('city')      or ''
+                    address_state   = csv_loc.get('state')     or bio_loc.get('state')     or ''
+                    address_country = csv_loc.get('country')   or bio_loc.get('country')   or ''
+                    address_zip     = csv_loc.get('zip_code')  or csv_loc.get('postal_code') or bio_loc.get('zip_code') or ''
+                    latitude        = csv_loc.get('latitude')  or bio_loc.get('latitude')  or ''
+                    longitude       = csv_loc.get('longitude') or bio_loc.get('longitude') or ''
 
                     posts_with_location = creator.get('posts_with_location', 0)
                     total_posts_scraped = creator.get('total_posts_scraped', 0)
@@ -176,8 +181,8 @@ def create_csv_from_analyzed_json_efficiently(analyzed_json_path: str, output_cs
                     top_collaboration_str = " | ".join(top_collaboration_names)
                     top_collaboration_brand_logo = " | ".join(top_collaboration_brand_logo_list)
 
-                    # niche_primary — flat field added in updated analyzed.json, fallback to nested
-                    niche_primary = creator.get('niche_primary') or creator.get('niche_data', {}).get('overall_niche', '')
+                    # niche_primary — flat field added in updated analyzed.json, fallback to nested, default to "Others"
+                    niche_primary = creator.get('niche_primary') or creator.get('niche_data', {}).get('overall_niche', '') or 'Others'
                     niche_secondary = ''
                     creator_type    = creator.get('creator_type', '')
                     follower_count  = creator.get('follower_count', 0)
@@ -198,6 +203,35 @@ def create_csv_from_analyzed_json_efficiently(analyzed_json_path: str, output_cs
                     primary_social_link = f"https://www.instagram.com/{username}" if username else ''
                     business_category   = creator.get('business_category', '')
                     bio_data            = (creator.get('biography', '') or '').replace('\n', ' ').replace(',', ' ')
+
+                    combined_hashtags_list = creator.get('combined_hashtags', []) or []
+                    if isinstance(combined_hashtags_list, str):
+                        combined_hashtags_list = [combined_hashtags_list]
+                    combined_hashtags_str = ' | '.join(str(item) for item in combined_hashtags_list if item)
+                    combined_hashtags_count = len(combined_hashtags_list)
+
+                    combined_mentions_list = creator.get('combined_mentions', []) or []
+                    if isinstance(combined_mentions_list, str):
+                        combined_mentions_list = [combined_mentions_list]
+                    combined_mentions_str = ' | '.join(str(item) for item in combined_mentions_list if item)
+                    combined_mentions_count = len(combined_mentions_list)
+
+                    hashtags_last_90_days_dict = creator.get('hashtags_last_90_days') or {}
+                    if isinstance(hashtags_last_90_days_dict, dict):
+                        hashtags_last_90_days = ' | '.join(
+                            f"{tag}:{count}" for tag, count in hashtags_last_90_days_dict.items()
+                        )
+                    else:
+                        hashtags_last_90_days = str(hashtags_last_90_days_dict)
+
+                    mentions_last_90_days_dict = creator.get('mentions_last_90_days') or {}
+                    if isinstance(mentions_last_90_days_dict, dict):
+                        mentions_last_90_days = ' | '.join(
+                            f"{mention}:{count}" for mention, count in mentions_last_90_days_dict.items()
+                        )
+                    else:
+                        mentions_last_90_days = str(mentions_last_90_days_dict)
+
                     last_updated        = creator.get('analyzed_date', '')
                     source              = creator.get('source', '')
                     total_collaborations = creator.get('total_collaborations', 0)
@@ -208,7 +242,7 @@ def create_csv_from_analyzed_json_efficiently(analyzed_json_path: str, output_cs
                     analyzed_date       = creator.get('analyzed_date', '')
 
                     row = [
-                        email, primary_social_link, username, processed_first_name, processed_last_name, creator_type,
+                        email, primary_social_link, username, user_pk, full_name, processed_first_name, processed_last_name, creator_type,
                         address_city, address_state, address_country, address_zip,
                         latitude, longitude,
                         posts_with_location, total_posts_scraped,
@@ -217,7 +251,10 @@ def create_csv_from_analyzed_json_efficiently(analyzed_json_path: str, output_cs
                         age_group, age, gender, phone_number, profile_picture,
                         tiktok_link, youtube_link, x_link, linktree_link, other_social_media,
                         business_category,
-                        bio_data, last_updated, source,
+                        bio_data, combined_hashtags_str, combined_mentions_str,
+                        combined_hashtags_count, combined_mentions_count,
+                        hashtags_last_90_days, mentions_last_90_days,
+                        last_updated, source,
                         total_collaborations, ugc_examples,
                         latest_post_link, latest_post_date,
                         scraped_date, analyzed_date
@@ -268,9 +305,15 @@ def main():
     print(f"{Fore.CYAN}{'='*70}{Style.RESET_ALL}\n")
     
     while True:
-        raw = input("📁  Enter the JSON file name (e.g. myproject.json): ").strip()
+        raw = input("📁  Enter the project name or file (e.g. myproject or myproject_data.json): ").strip()
         if raw:
-            analyzed_json_file = raw if raw.endswith('.json') else raw + '.json'
+            # Accept bare name, _data.json, or .json
+            if raw.endswith('_data.json'):
+                analyzed_json_file = raw
+            elif raw.endswith('.json'):
+                analyzed_json_file = raw
+            else:
+                analyzed_json_file = raw + '_data.json'
             break
         print("    ⚠  File name cannot be empty.")
 
@@ -284,37 +327,26 @@ def main():
 
     print(f"{Fore.GREEN}✓ Found {analyzed_json_file}{Style.RESET_ALL}")
     print(f"{Fore.GREEN}✓ Output: {output_csv_file}{Style.RESET_ALL}\n")
-    
+
     try:
         with open(analyzed_json_file, 'rb') as json_file:
             parser = ijson.parse(json_file)
-            analyzed_data_info = {}
+            meta = {}
             for prefix, event, value in parser:
                 if prefix == 'analysis_date' and event == 'string':
-                    analyzed_data_info['analysis_date'] = value
+                    meta['analysis_date'] = value
                 if prefix == 'total_creators_analyzed' and event == 'number':
-                    analyzed_data_info['total_creators_analyzed'] = int(value)
-                if prefix == 'creators_with_location' and event == 'number':
-                    analyzed_data_info['creators_with_location'] = int(value)
-                if prefix == 'location_coverage_percentage' and event == 'number':
-                    analyzed_data_info['location_coverage_percentage'] = float(value)
+                    meta['total_creators_analyzed'] = int(value)
                 if prefix == 'creators' and event == 'start_array':
                     break
-            
-            analysis_date = analyzed_data_info.get('analysis_date', 'Unknown')
-            total_creators = analyzed_data_info.get('total_creators_analyzed', 0)
-            creators_with_location = analyzed_data_info.get('creators_with_location', 0)
-            location_percentage = analyzed_data_info.get('location_coverage_percentage', 0)
-            
-            print(f"{Fore.CYAN}Analysis Information:{Style.RESET_ALL}")
-            print(f"  Date: {analysis_date}")
-            print(f"  Total Creators: {total_creators}")
-            print(f"  With Location: {creators_with_location} ({location_percentage}%)")
-            print()
+        print(f"{Fore.CYAN}Analysis Information:{Style.RESET_ALL}")
+        print(f"  Date: {meta.get('analysis_date', 'Unknown')}")
+        print(f"  Total Creators: {meta.get('total_creators_analyzed', 0)}")
+        print()
     except Exception as e:
         print(f"{Fore.RED}Error reading JSON metadata: {str(e)}{Style.RESET_ALL}")
         return
-    
+
     success, total_users = create_csv_from_analyzed_json_efficiently(analyzed_json_file, output_csv_file)
     
     if success:

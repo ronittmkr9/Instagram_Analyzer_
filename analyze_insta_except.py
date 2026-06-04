@@ -3,6 +3,7 @@ import sys
 import json
 import datetime
 import re
+import unicodedata
 from pathlib import Path
 from typing import List, Dict, Optional, Set
 from colorama import init, Fore, Style
@@ -11,6 +12,19 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import freeze_support
 from tqdm import tqdm
 from collections import Counter
+
+# Load known first names (SSA list) for basic validation
+FIRST_NAMES: Set[str] = set()
+try:
+    ssa_path = os.path.join(os.path.dirname(__file__), 'unique_names_ssa.txt')
+    if os.path.exists(ssa_path):
+        with open(ssa_path, 'r', encoding='utf-8') as _f:
+            for line in _f:
+                parts = line.strip().split(',')
+                if parts:
+                    FIRST_NAMES.add(parts[0].strip().lower())
+except Exception:
+    FIRST_NAMES = set()
 
 # Import the comprehensive bio location extractor
 from bio_location import extract_location_from_bio
@@ -277,6 +291,73 @@ def load_json_file(file_path: str) -> dict:
         return {}
 
 
+NAME_PHRASE_KEYWORDS = {
+    'with', 'and', 'the', 'of', 'for', 'from', 'by', 'life', 'soul', 'heart',
+    'travel', 'blogger', 'official', 'photography', 'photo', 'artist',
+    'style', 'fashion', 'beauty', 'content', 'lifestyle', 'vibes',
+    'creator', 'account', 'nomad', 'wanderlust', 'daily', 'journey',
+    'adventure', 'fitness', 'wellness', 'coach', 'guide', 'influencer'
+}
+DOMAIN_LIKE_PATTERN = re.compile(
+    r'(?:www\.|https?://|instagram|tiktok|twitter|linktr\.ee|\.com|\.net|\.org|\.io|\.tv|\.co\b)',
+    re.IGNORECASE
+)
+
+
+def normalize_person_name(text: str) -> str:
+    """Normalize a full name string for title-cased, cleaned output."""
+    if not text:
+        return ''
+
+    text = unicodedata.normalize('NFKC', text)
+    text = text.replace('\u2018', "'").replace('\u2019', "'").replace('`', "'")
+    text = text.replace('_', ' ')
+    text = re.sub(r'[\d]', '', text)
+    text = re.sub(r'[\u2000-\u200F\u2028-\u202F\uFEFF]', ' ', text)
+    text = re.sub(r'[^\w\s\'-]', ' ', text, flags=re.UNICODE)
+
+    tokens = []
+    for token in text.split():
+        token = token.strip(" -'")
+        if not token:
+            continue
+        token = unicodedata.normalize('NFKC', token)
+        token = ''.join(ch for ch in token if ch.isalpha() or ch in {"'", "-"})
+        if not token or not any(ch.isalpha() for ch in token):
+            continue
+        tokens.append(token)
+
+    cleaned = ' '.join(tokens)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned.title()
+
+
+def looks_like_phrase(value: str) -> bool:
+    if not value:
+        return False
+    lower = value.lower()
+    if DOMAIN_LIKE_PATTERN.search(lower):
+        return True
+    if len(lower) > 40 and ' ' in lower:
+        return True
+    if any(word in lower.split() for word in NAME_PHRASE_KEYWORDS):
+        return True
+    return False
+
+
+def derive_first_name_from_username(username: str) -> Optional[str]:
+    if not username:
+        return None
+    username = normalize_person_name(username)
+    if not username:
+        return None
+    parts = re.split(r'[^A-Za-z]+', username)
+    for part in parts:
+        if part and len(part) >= 2:
+            return part.title()
+    return None
+
+
 def extract_location_from_posts(posts: List[dict]) -> Dict:
     if not posts:
         return {
@@ -435,24 +516,46 @@ def parse_location_to_address_components(location_name: str, address: str = None
 
 def load_usernames_to_exclude(csv_path: str) -> Set[str]:
     usernames_to_exclude = set()
+
+    def normalize_token(token: str) -> Optional[str]:
+        if not token:
+            return None
+        token = token.strip()
+        return token.lower() if token else None
+
+    def parse_text_list(stream):
+        for line in stream:
+            for token in re.split(r'[\s,;]+', line):
+                normalized = normalize_token(token)
+                if normalized:
+                    usernames_to_exclude.add(normalized)
+
     try:
         if not os.path.exists(csv_path):
-            print(f"{Fore.RED}Error: Exclusion CSV file not found at path: {csv_path}{Style.RESET_ALL}")
+            print(f"{Fore.RED}Error: Exclusion file not found at path: {csv_path}{Style.RESET_ALL}")
             return set()
+
         with open(csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            fieldnames = [name.lower() for name in reader.fieldnames]
-            if 'username' not in fieldnames:
-                print(f"{Fore.RED}Error: CSV file '{csv_path}' must contain a 'username' column.{Style.RESET_ALL}")
-                return set()
-            username_key = next(name for name in reader.fieldnames if name.lower() == 'username')
-            for row in reader:
-                username = row.get(username_key)
-                if username:
-                    usernames_to_exclude.add(username.strip().lower())
+            if csv_path.lower().endswith('.csv'):
+                reader = csv.DictReader(f)
+                fieldnames = [name.lower() for name in (reader.fieldnames or [])]
+                if 'username' in fieldnames:
+                    username_key = next(name for name in reader.fieldnames if name.lower() == 'username')
+                    for row in reader:
+                        username = row.get(username_key)
+                        normalized = normalize_token(username)
+                        if normalized:
+                            usernames_to_exclude.add(normalized)
+                else:
+                    f.seek(0)
+                    parse_text_list(f)
+            else:
+                parse_text_list(f)
+
         print(f"{Fore.GREEN}Successfully loaded {len(usernames_to_exclude)} usernames to exclude.{Style.RESET_ALL}")
     except Exception as e:
-        print(f"{Fore.RED}Error reading exclusion CSV file '{csv_path}': {str(e)}{Style.RESET_ALL}")
+        print(f"{Fore.RED}Error reading exclusion file '{csv_path}': {str(e)}{Style.RESET_ALL}")
+
     return usernames_to_exclude
 
 
@@ -460,17 +563,20 @@ def extract_basic_info(user_info: dict) -> dict:
     user_data = user_info.get('data', {}).get('user', {})
     username = user_data.get('username', '')
     follower_count = user_data.get('follower_count', '')
-    full_name = user_data.get('full_name', '')
+    raw_full_name = user_data.get('full_name', '') or ''
+    full_name = normalize_person_name(raw_full_name)
     biography = user_data.get('biography', '')
     category = user_data.get('category', '')
     profile_picture = f"https://assets.veelapp.com/{username}.jpg" if username != '' else ''
+    pk = user_data.get('pk') or user_data.get('id') or (str(username) if username else None)
     return {
         'username': username,
         'follower_count': follower_count,
         'full_name': full_name,
         'biography': biography,
         'profile_picture': profile_picture,
-        'category': category
+        'category': category,
+        'pk': pk
     }
 
 
@@ -533,183 +639,182 @@ def extract_social_links(user_info: dict) -> dict:
     return extracted_links
 
 
-def identify_niche(user_info: dict) -> dict:
+def identify_niche(user_info: dict, posts: Optional[List[dict]] = None) -> dict:
     niche_categories = {
    "Fashion & Beauty": [
 
             "fashion", "style", "outfit", "clothing", "model", "dress", "accessories",
-
             "fashionista", "ootd", "stylist", "boutique", "wardrobe", "trend", "chic",
-
             "makeup", "skincare", "beauty", "cosmetics", "haircare", "nails", "glam",
-
             "makeupartist", "beautician", "mua", "beautyblogger", "makeover", "cosmetic",
-
-            "skincareroutine", "lashes", "aesthetic", "hairstyle", "grwm", "luxury"
+            "skincareroutine", "lashes", "aesthetic", "hairstyle", "grwm", "luxury",
+            "streetwear", "sneakerhead", "couture", "vintage", "styleblogger", "hairtutorial"
+           "runway", "catwalk", "vogue", "designerwear", "fashionweek", "haute", "glamlook",
+           "makeoverartist", "skincareproducts", "beautycare", "nailart", "haircolor", "balayage",
+           "blowdry", "contouring", "lipstick", "eyeliner", "mascara", "foundation", "spa",
+          "facial", "grooming", "selftan", "beautyhaul", "thriftstyle", "capsulewardrobe"
 
         ],
 
         "Lifestyle": [
 
             "lifestyle", "life", "daily", "routine", "inspiration", "motivation",
-
             "blogger", "lifestyleblogger", "living", "vibes", "mindful",
-
             "selfcare", "selflove", "positivity", "hustle", "grind",
-
+            "coaching", "minimalism", "homedecor", "wellbeing"
             "entertainment", "movie", "film", "tv", "television", "cinema", "streaming",
-
             "comedy", "funny", "humor", "laugh", "joke", "prank", "comedian", "meme",
-
             "music", "musician", "song", "singer", "band", "concert",
-
-            "dance", "dancer", "choreography", "viral", "trending", "vlog", "vlogger"
+            "dance", "dancer", "choreography", "viral", "trending", "vlog", "vlogger",
+            "mindfulness", "journaling", "productivityhacks", "morningroutine", "nightroutine",
+            "cozyvibes", "homemaking", "parenting", "familylife", "relationshipgoals", "weekendvibes",
+            "relaxation", "hobbies", "leisure", "mindfulnesspractice", "wellbeingjourney",
+            "lifestyleinspo", "dailygrind", "balance", "zenlife"
 
         ],
 
         "Gaming & eSports": [
 
             "gaming", "gamer", "videogames", "game", "esports", "playstation", "xbox",
-
             "nintendo", "streamer", "twitch", "console", "pc", "mobile", "rpg",
-
             "fps", "mmorpg", "gamingsetup", "gamedev", "minecraft", "fortnite",
-
-            "pubg", "valorant", "lol", "leagueoflegends", "gamestreamer"
+            "pubg", "valorant", "lol", "leagueoflegends", "gamestreamer",
+             "gamerlife", "proplayer", "esportsleague", "gamingcommunity", "retro", "arcade",
+             "gamereview", "walkthrough", "gameplay", "speedrun", "modding", "gametips",
+            "battlepass", "skins", "gaminggear", "headset", "controller", "gamingchair",
+            "esportsarena", "competitivegaming"
 
         ],
 
         "Food & Cooking": [
 
             "food", "cooking", "recipe", "chef", "foodie", "cuisine", "baking",
-
             "delicious", "yummy", "foodblogger", "culinary", "restaurant", "eats",
-
             "tasty", "kitchen", "homecook", "bbq", "vegan", "foodphotography",
-
+            "mealprep", "foodstyling", "recipevideo",
             "healthyfood", "meal", "dessert", "pastry", "baker", "instafood",
+            "foodlover", "nutrition", "plantbased", "vegetarian",
+            "brunch", "supper", "streetfood", "fusioncuisine", "gourmet", "finedining",
+            "comfortfood", "farmtotable", "organic", "superfoods", "smoothie", "juicing",
+            "foodporn", "foodiegram", "chefskills", "cookingtips", "kitchenhacks", "plating",
+            "gastronomy", "foodtruck", "foodfestival"
 
-            "foodlover", "nutrition", "plantbased", "vegetarian"
 
         ],
 
         "Fitness & Wellness": [
 
             "fitness", "workout", "gym", "exercise", "health", "training", "muscle",
-
             "fit", "fitnessmotivation", "trainer", "bodybuilding", "crossfit", "yoga",
-
             "pilates", "running", "weightloss", "gains", "cardio", "strength",
-
             "wellness", "mindfulness", "meditation", "nutritionist", "dietitian",
+            "wellbeing", "mental", "holistic", "athleticism", "sportsmotivation",
+            "protein", "fitspo", "workoutvideo",
+            "HIIT", "calisthenics", "kettlebell", "stretching", "recovery", "supplements",
+            "macros", "cleaneating", "wellnesscoach", "fitnessjourney", "gymrat", "sweatlife",
+            "personaltrainer", "endurance", "flexibility", "sportsinjury", "rehab", "breathwork",
+            "coldplunge", "biohacking"
 
-            "wellbeing", "mental", "holistic", "athleticism", "sportsmotivation"
 
         ],
 
         "Education / Skill": [
 
             "education", "learning", "school", "knowledge", "teach", "study", "student",
-
             "lesson", "teacher", "tutor", "academic", "university", "college", "learn",
-
             "tutorial", "howto", "tips", "skills", "development", "coaching",
-
             "onlinecourse", "elearning", "productivity", "career", "professional",
+            "selfimprovement", "growth", "language", "science", "history",
+            "edtech", "onlinelearning", "certification", "examprep", "studytips", "research",
+            "thesis", "dissertation", "mentorship", "coachingprogram", "careerdevelopment",
+            "workshops", "seminars", "lectures", "lifelonglearning", "skillshare", "knowledgebase",
+            "peerlearning", "hackathon", "innovationlab"
 
-            "selfimprovement", "growth", "language", "science", "history"
 
         ],
 
         "Travel": [
 
             "travel", "wanderlust", "adventure", "explore", "tourism", "vacation",
-
             "trip", "journey", "destination", "traveler", "backpacker", "nomad",
-
             "wanderer", "explorer", "digitalnomad", "roadtrip", "travelgram",
-
             "worldtravel", "bucketlist", "hiking", "camping", "solotravel",
+            "travellife", "travelphotography", "hotel", "resort", "beach",
+            "citybreak", "travelguide", "hostel", "airbnb","globetrotter", "travelblogger", "travelvlog", "travelinspo",
+            "travelguidebook", "travelagency", "travelplanner", "traveldeals", "cheapflights", "travelhacks",
+            "packingtips", "travelessentials", "wandergram", "adventuretime", "safaritrip",
+             "culturaltravel", "ecotourism", "travelbucketlist"
 
-            "travellife", "travelphotography", "hotel", "resort", "beach"
 
         ],
 
         "Tech & Gadgets": [
 
             "technology", "tech", "gadget", "device", "software", "app", "smartphone",
-
             "computer", "digital", "innovation", "startup", "coding", "developer",
-
             "geek", "ai", "cybersecurity", "programming", "iot", "review",
-
             "unboxing", "techreview", "apple", "android", "saas", "machinelearning",
-
-            "datascience", "robotics", "wearables", "smartwatch"
-
+            "datascience", "robotics", "wearables", "smartwatch",
+            "gadgetreview", "dronestagram","AR", "VR", "blockchain", "fintech", "cloudcomputing", "devops", "opensource",
+            "codinglife", "bugfix", "technews", "gadgetlover", "smarttech", "innovationhub",
+            "AItools", "roboticslab", "3Dprinting", "nanotech", "biotech", "quantumcomputing",
+            "cybersecuritytips", "techcommunity"
         ],
 
         "Personal Finance": [
 
             "finance", "investing", "stocks", "cryptocurrency", "money", "financial",
-
             "wealth", "investor", "trader", "bitcoin", "crypto", "forex", "portfolio",
-
             "business", "entrepreneur", "marketing", "startup", "success", "ceo",
-
             "founder", "corporate", "leadership", "boss", "realestate",
-
             "passiveincome", "budgeting", "savings", "frugal", "sidehustle",
-
-            "stockmarket", "dividends", "financialfreedom", "moneytips"
+            "stockmarket", "dividends", "financialfreedom", "moneytips",
+            "tax", "insurance", "budget", "budgetingtips", "financialplanning", "retirementfund", "pension", "wealthmanagement",
+            "investmentstrategy", "financialadvisor", "moneyhacks", "debtfree", "creditcards",
+           "loans", "mortgage", "cashflow", "economicgrowth", "inflation", "recession",
+           "financialliteracy", "taxplanning", "moneygoals"
 
         ],
 
         "Art / DIY": [
 
             "art", "artist", "drawing", "painting", "creative", "design", "illustration",
-
             "designer", "painter", "sculptor", "gallery", "artwork", "canvas",
-
             "diy", "handmade", "craft", "crafting", "upcycle", "homedecor",
-
             "interiordesign", "photography", "digitalart", "graffiti",
-
-            "sketch", "watercolor", "calligraphy", "pottery", "woodwork"
+            "sketch", "watercolor", "calligraphy", "pottery", "woodwork",
+            "crafts", "renovation", "DIYproject", "mixedmedia", "digitalillustration", "animation", "3Dart", "collage", "mural",
+            "streetart", "installationart", "performanceart", "diycrafts", "handmadejewelry",
+            "knitting", "crochet", "embroidery", "sewing", "papercraft", "origami", "resinart",
+            "candlemaking", "soapmaking", "upcycling", "repurpose"
 
         ],
 
         "Pets & Animals": [
 
             "pets", "dog", "cat", "animal", "puppy", "kitten", "wildlife",
-
             "veterinarian", "petcare", "rescue", "adoption", "dogtrainer",
-
             "animallover", "petsofinstagram", "dogsofinstagram", "catsofinstagram",
-
             "exoticpets", "birdwatching", "nature", "conservation",
-
-            "petowner", "furbaby", "doglife", "catlife", "reptile"
-
+            "petowner", "furbaby", "doglife", "catlife", "reptile","birdsofinstagram", "wildlifephotography",
+            "dogmom", "catmom", "dogdad", "catdad", "doglover", "catlover", "petphotography", "dogtricks",
+          "dogtraining", "doggrooming", "petgrooming", "petfood", "rawfeed", "pettravel", "dogpark", "catstagram",
+           "dogsoftwitter", "goldenretriever", "frenchbulldog", "husky", "shiba", "mainecoon", "siamese", "bunny",
+          "hamster", "axolotl", "fishkeeping", "aquarium",
         ],
 
         "Family & Parenting": [
 
-            "family", "parenting", "mom", "dad", "children", "kids", "baby",
-
-            "mother", "father", "parent", "motherhood", "fatherhood", "toddler",
-
-            "newborn", "pregnancy", "momlife", "dadlife", "parentingtips",
-
-            "familytime", "homeschool", "siblings", "grandparent",
-
-            "familyfirst", "raisingkids", "mommy", "daddy", "blessed"
-
+            "family", "parenting", "mom", "dad", "children", "kids", "baby", "attachmentparenting", "positiveparenting", "respectfulparenting",
+            "newborn", "pregnancy", "momlife", "dadlife", "parentingtips","toddleractivities", "kidsactivities", "babyledweaning", "breastfeeding",
+            "mother", "father", "parent", "motherhood", "fatherhood", "toddler", "babygear", "kidsroom", "familyvlog", "familygames",
+            "familytime", "homeschool", "siblings", "grandparent", "formula", "postpartum", "pregnancyjourney", "maternity", "twinmom", "boymom", "girlmom", "sahm",
+            "familyfirst", "raisingkids", "mommy", "daddy", "blessed", "gentleparenting",
+            "workingmom", "singlemom", "blendedamily", "adoptionjourney", "fostering", "specialneeds", "autismawareness", "schoolprep", "kidsfashion",
         ],
 
         "Others": []
 
-    
     }
     user_data = user_info.get('data', {}).get('user', {})
     biography = user_data.get('biography', '') or ''
@@ -720,6 +825,24 @@ def identify_niche(user_info: dict) -> dict:
         'username': username,
         'full_name': full_name
     }
+
+    # Extract captions from posts if available
+    caption_texts = []
+    if posts and isinstance(posts, list):
+        for post in posts:
+            try:
+                node = post.get('node', {})
+                caption_obj = node.get('caption')
+                if caption_obj and isinstance(caption_obj, dict):
+                    caption = caption_obj.get('text', '') or ''
+                    if caption:
+                        caption_texts.append(caption)
+            except (AttributeError, TypeError, KeyError):
+                continue
+
+    if caption_texts:
+        all_text_sources['captions'] = ' '.join(caption_texts)
+
     all_keywords = set()
     for keywords in niche_categories.values():
         all_keywords.update(keywords)
@@ -744,7 +867,8 @@ def identify_niche(user_info: dict) -> dict:
     source_weights = {
         'username': 2.0,
         'full_name': 1.0,
-        'biography': 1.5
+        'biography': 1.5,
+        'captions': 1.2
     }
     niche_scores = {category: 0 for category in niche_categories}
     detailed_matches = {category: [] for category in niche_categories}
@@ -766,7 +890,7 @@ def identify_niche(user_info: dict) -> dict:
     distribution = {category: round(score / total_score * 100, 1) for category, score in niche_scores.items() if score > 0}
     significant_distribution = {k: v for k, v in distribution.items() if v >= 2}
     sorted_niches = sorted(niche_scores.items(), key=lambda x: x[1], reverse=True)
-    overall_niche = sorted_niches[0][0] if sorted_niches and sorted_niches[0][1] > 0 else None
+    overall_niche = sorted_niches[0][0] if sorted_niches and sorted_niches[0][1] > 0 else "Others"
     confidence_scores = {}
     max_score = sorted_niches[0][1] if sorted_niches and sorted_niches[0][1] > 0 else 1
     for category in niche_categories:
@@ -1362,13 +1486,59 @@ def extract_email(user_info: dict) -> dict:
         return {'email': None}
 
 
+def clean_username_as_name(username: str) -> Optional[str]:
+    if not username:
+        return None
+    cleaned = re.sub(r'[^A-Za-z_.]', '', username)
+    parts = re.split(r'[_.]', cleaned)
+    for part in parts:
+        part = part.strip()
+        if part and len(part) >= 2 and part.isalpha():
+            return part.capitalize()
+    alpha_only = re.sub(r'[^A-Za-z]', '', username)
+    if alpha_only and len(alpha_only) >= 2:
+        return alpha_only.capitalize()
+    return None
+
+
 def extract_first_and_last_name(user_info: dict) -> dict:
+    """
+    Name extraction priority:
+      1. Username has _ or .  → first=clean username, last='' (no full_name used)
+      2. Plain username (no _ or .) is in SSA list → first=username, last=''
+      3. Plain username not in SSA, full_name is exactly 2 words and first is in SSA
+         → first=word1, last=word2
+      4. Everything else → first=username, last=''
+    """
     user_data = user_info.get('data', {}).get('user', {})
-    full_name = user_data.get('full_name', '') or ''
-    names = full_name.split()
-    first_name = names[0] if names else None
-    last_name = " ".join(names[1:]) if len(names) > 1 else None
-    return {'first_name': first_name, 'last_name': last_name}
+    raw_full_name = user_data.get('full_name', '') or ''
+    username = user_data.get('username', '') or ''
+
+    # ── Rule 1: username has _ or . → use raw username as-is, skip full_name ───
+    # Do NOT split on separators — just_nvte should stay "just_nvte", not "Just"
+    has_separator = '_' in username or '.' in username
+    if has_separator:
+        return {'first_name': username, 'last_name': ''}
+
+    # ── Rule 2: plain username is a known SSA first name ──────────────────────
+    username_clean = re.sub(r"[^A-Za-z'-]", '', username).lower()
+    if username_clean and username_clean in FIRST_NAMES:
+        return {'first_name': username_clean.capitalize(), 'last_name': ''}
+
+    # ── Rule 3: full_name is exactly 2 words and first word is in SSA list ────
+    normalized_full_name = normalize_person_name(raw_full_name)
+    if normalized_full_name and not looks_like_phrase(normalized_full_name):
+        tokens = normalized_full_name.split()
+        if len(tokens) == 2:
+            candidate_first = tokens[0]
+            candidate_last  = tokens[1]
+            token_clean = re.sub(r"[^A-Za-z'-]", '', candidate_first).lower()
+            if token_clean and token_clean in FIRST_NAMES:
+                return {'first_name': candidate_first, 'last_name': candidate_last}
+
+    # ── Rule 4 (fallback): use username as first name, no last name ───────────
+    first_name = clean_username_as_name(username) or username
+    return {'first_name': first_name, 'last_name': ''}
 
 
 def determine_creator_size(user_info: dict) -> dict:
@@ -1470,6 +1640,35 @@ def get_latest_post_info(post_info: dict) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# HELPER: build reels dict from a list of raw post edges
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_reels_dict(all_posts: List[dict]) -> dict:
+    """
+    Return a dict with reels_url set to a list of Instagram post URLs for the
+    three most-recent Reels (product_type == 'clips').
+    """
+    reel_links = []
+    sorted_by_time = sorted(
+        all_posts,
+        key=lambda x: x.get('node', {}).get('taken_at', 0),
+        reverse=True
+    )
+    for _p in sorted_by_time:
+        if len(reel_links) >= 3:
+            break
+        try:
+            _n = _p.get('node', {})
+            if _n.get('product_type') == 'clips' and _n.get('code'):
+                reel_links.append(f"https://www.instagram.com/p/{_n['code']}")
+        except (AttributeError, TypeError, KeyError):
+            continue
+    return {
+        'reels_url': reel_links
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # BUILD ai_analyzed FORMAT FOR A SINGLE CREATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1482,7 +1681,7 @@ def build_ai_analyzed_entry(
     bio_location: dict,
     csv_location: dict,
     collaboration_data: dict,
-    gender_detection: dict,   # ← NEW: result from Detector.detect()
+    gender_detection: dict,
     max_posts: int = 30
 ) -> dict:
     """
@@ -1577,6 +1776,9 @@ def build_ai_analyzed_entry(
         except (AttributeError, TypeError, KeyError):
             continue
 
+    # ── reels (up to 3 most recent reels) ────────────────────────────────────
+    reels = build_reels_dict(all_posts)
+
     # ── creator_location_from_bio ─────────────────────────────────────────────
     creator_location_from_bio = {
         'address':   None,
@@ -1616,6 +1818,7 @@ def build_ai_analyzed_entry(
         'bio':                        basic_info.get('biography'),
         'total_posts':                total_posts,
         'total_collaborations':       collaboration_data.get('total_collaborations', 0),
+         **reels ,
         'creator_location_from_bio':  creator_location_from_bio,
         'creator_location_from_csv':  creator_location_from_csv,
         'posts':                      post_list
@@ -1627,13 +1830,6 @@ def build_ai_analyzed_entry(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def analyze_creator_data(creator_dir: str, gender_lookup: dict = None) -> Optional[dict]:
-    """
-    Main analysis function for a single creator.
-    gender_lookup: dict mapping username -> {gender, age_group, gender_confidence,
-                                              age_confidence, detection_status}
-                   Built in the main process before the parallel pool starts.
-    Returns {'analyzed': ..., 'ai_analyzed': ...} or None on failure.
-    """
     if gender_lookup is None:
         gender_lookup = {}
     try:
@@ -1683,7 +1879,7 @@ def analyze_creator_data(creator_dir: str, gender_lookup: dict = None) -> Option
         phone_number_info    = extract_phone_number(user_info)
         total_posts, top_posts, avg_er = calculate_top_post_er(post_info, user_info)
         collaboration_data   = identify_collaborations(all_posts)
-        niche_data           = identify_niche(user_info)
+        niche_data           = identify_niche(user_info, all_posts)
         creator_pricing_info = extract_creator_pricing(user_info, all_posts)
         hashtag_mention_data = extract_hashtags_and_mentions(all_posts, limit=10)
         basic_info           = extract_basic_info(user_info)
@@ -1699,7 +1895,6 @@ def analyze_creator_data(creator_dir: str, gender_lookup: dict = None) -> Option
             'detection_status': 'Not run'
         })
 
-        # Fallback to pronouns if image detection returned 'Unknown'
         image_gender = gender_detection.get('gender', 'Unknown')
         if image_gender == 'Unknown':
             pronoun_gender = identify_gender_from_pronouns(user_info)
@@ -1708,13 +1903,15 @@ def analyze_creator_data(creator_dir: str, gender_lookup: dict = None) -> Option
                 gender_detection['gender'] = pronoun_gender
                 gender_detection['detection_status'] = 'Pronoun fallback'
 
-        # Final resolved gender for display
         resolved_gender = gender_detection.get('gender', 'Unknown')
         age_group       = gender_detection.get('age_group', 'Unknown')
 
         scraped_timestamp = os.path.getctime(creator_dir)
         scraped_date      = datetime.datetime.fromtimestamp(scraped_timestamp).strftime('%Y-%m-%d')
         latest_post_info  = get_latest_post_info(post_info)
+
+        # ── reels (shared by both analyzed and ai_analyzed entries) ──────────
+        reels = build_reels_dict(all_posts)
 
         # ── analyzed.json: build 25-post list ────────────────────────────────
         sorted_posts_analyzed = sorted(
@@ -1783,14 +1980,31 @@ def analyze_creator_data(creator_dir: str, gender_lookup: dict = None) -> Option
             except (AttributeError, TypeError, KeyError):
                 continue
 
-        # ── address and lat/lng from bio only ────────────────────────────────
-        bio_address_city    = bio_location.get('city')    or None
-        bio_address_state   = bio_location.get('state')   or None
-        bio_address_country = bio_location.get('country') or None
-        bio_address_zip     = bio_location.get('zip_code') or None
+        combined_hashtags = sorted({
+            hashtag
+            for post in analyzed_post_list
+            for hashtag in (post.get('hashtags') or [])
+        })
+        combined_mentions = sorted({
+            mention
+            for post in analyzed_post_list
+            for mention in (post.get('mentions') or [])
+        })
+        combined_hashtags_count = len(combined_hashtags)
+        combined_mentions_count = len(combined_mentions)
 
-        bio_lat = bio_location.get('latitude') or bio_location.get('lat') or None
-        bio_lng = bio_location.get('longitude') or bio_location.get('lng') or None
+        # ── address and lat/lng: prefer CSV location, fall back to bio ─────────
+        _csv_loc = csv_location
+        bio_address_city    = _csv_loc.get('city')    or bio_location.get('city')    or None
+        bio_address_state   = _csv_loc.get('state')   or bio_location.get('state')   or None
+        bio_address_country = _csv_loc.get('country') or bio_location.get('country') or None
+        bio_address_zip     = (_csv_loc.get('zip_code') or _csv_loc.get('postal_code') or _csv_loc.get('post_code')
+                               or bio_location.get('zip_code') or None)
+
+        bio_lat = (_csv_loc.get('latitude') or _csv_loc.get('lat')
+                   or bio_location.get('latitude') or bio_location.get('lat') or None)
+        bio_lng = (_csv_loc.get('longitude') or _csv_loc.get('lng')
+                   or bio_location.get('longitude') or bio_location.get('lng') or None)
         if not bio_lat and bio_address_city:
             for _loc in location_analysis.get('all_locations', []):
                 if (_loc.get('city') == bio_address_city
@@ -1820,6 +2034,7 @@ def analyze_creator_data(creator_dir: str, gender_lookup: dict = None) -> Option
             'business_category':           basic_info.get('category'),
             'profile_picture':             basic_info.get('profile_picture'),
             'social_links':                social_links,
+            'user_pk':                     basic_info.get('pk'),
             'primary_location_name':       location_analysis['primary_location'],
             'latitude':                    bio_latitude,
             'longitude':                   bio_longitude,
@@ -1827,6 +2042,16 @@ def analyze_creator_data(creator_dir: str, gender_lookup: dict = None) -> Option
             'address_state':               bio_address_state,
             'address_country':             bio_address_country,
             'address_zip':                 bio_address_zip,
+            'creator_location_from_csv': {
+                'address':   _csv_loc.get('address') or None,
+                'city':      _csv_loc.get('city') or None,
+                'country':   _csv_loc.get('country') or None,
+                'state':     _csv_loc.get('state') or None,
+                'zip_code':  _csv_loc.get('zip_code') or _csv_loc.get('postal_code') or _csv_loc.get('post_code') or None,
+                'latitude':  _csv_loc.get('latitude') or None,
+                'longitude': _csv_loc.get('longitude') or None,
+            },
+            **reels ,
             'all_locations':               location_analysis['all_locations'],
             'posts_with_location':         location_analysis['posts_with_location'],
             'total_posts_scraped':         location_analysis['total_posts'],
@@ -1846,13 +2071,17 @@ def analyze_creator_data(creator_dir: str, gender_lookup: dict = None) -> Option
             'recent_collaborations':       collaboration_data['recent_collaborations'],
             'ugc_examples':                collaboration_data['ugc_examples'],
             'top_collaboration':           collaboration_data['all_collaborations'],
-            'niche_primary':               niche_data.get('overall_niche'),
+            'niche_primary':               niche_data.get('overall_niche') or 'Others',
             'niche_data':                  niche_data,
             'creator_type':                creator_pricing_info.get('creator_type'),
             'tier':                        creator_pricing_info.get('tier'),
             'creator_pricing_metrics':     creator_pricing_info.get('creator_pricing_metrics'),
             'hashtags_last_90_days':       hashtag_mention_data['hashtags'],
             'mentions_last_90_days':       hashtag_mention_data['mentions'],
+            'combined_hashtags':           combined_hashtags,
+            'combined_mentions':           combined_mentions,
+            'combined_hashtags_count':     combined_hashtags_count,
+            'combined_mentions_count':     combined_mentions_count,
             'posts_analyzed_for_hashtags': hashtag_mention_data['total_posts_analyzed'],
             'hashtag_analysis_date_range': hashtag_mention_data['date_range'],
             'latest_post_date':            latest_post_info.get('latest_post_date'),
@@ -1895,24 +2124,13 @@ load_usernames_from_csv = load_usernames_to_exclude
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    """
-    Main function.
-    Runs gender/age detection (single-threaded, main process) BEFORE the
-    parallel analysis loop so that model weights are never forked across
-    processes.
+    print(f"{Fore.CYAN}Instagram Creator Data Analyzer (Parallelized){Style.RESET_ALL}")
 
-    Args accepted:
-        --project <name>   Project name used for output filenames.
-        --output  <path>   Directory that contains creator sub-folders.
-        <exclusion.csv>    Optional path to a CSV of usernames to skip.
-    """
-    print(f"{Fore.CYAN}Instagram Creator Data Analyzer (Parallelized + Gender/Age){Style.RESET_ALL}")
-
-    # ── Parse arguments ───────────────────────────────────────────────────────
     args = sys.argv[1:]
     project_name  = None
     csv_file_name = None
     output_path   = None
+    skip_gender   = False
 
     i = 0
     while i < len(args):
@@ -1922,6 +2140,9 @@ def main():
         elif args[i] == "--output" and i + 1 < len(args):
             output_path = args[i + 1]
             i += 2
+        elif args[i] == "--analyze":
+            skip_gender = True
+            i += 1
         elif not args[i].startswith("--"):
             csv_file_name = args[i]
             i += 1
@@ -1950,7 +2171,6 @@ def main():
         return
     print(f"{Fore.CYAN}Reading from: {base_path}{Style.RESET_ALL}")
 
-    # ── Collect creator folders ───────────────────────────────────────────────
     all_creator_folders = [
         d for d in os.listdir(base_path)
         if os.path.isdir(os.path.join(base_path, d))
@@ -1981,45 +2201,45 @@ def main():
             return
         print(f"{Fore.GREEN}Found {len(creators_to_analyze)} creator folders to analyze.{Style.RESET_ALL}")
 
-    # ── PHASE 1: Gender / age detection (main process, sequential) ────────────
-    # Models cannot be shared across forked processes, so we run detection here
-    # and pass results into the parallel worker via a plain dict.
-    print(f"\n{Fore.YELLOW}Phase 1: Detecting gender & age from profile images...{Style.RESET_ALL}")
-
-    detector = Detector()
+    # ── Gender detection phase (skipped when --analyze flag is used) ──────────
     gender_lookup: Dict[str, dict] = {}
 
-    for idx, creator_folder in enumerate(tqdm(
-        creators_to_analyze,
-        desc=f"{Fore.GREEN}Gender detection{Style.RESET_ALL}",
-        unit=" creators"
-    )):
-        # Read username from userInfo.json (folder name == username in most cases,
-        # but we confirm from the file to be safe)
-        user_info_path = os.path.join(base_path, creator_folder, 'userInfo.json')
-        username = creator_folder  # safe default
-        if os.path.exists(user_info_path):
-            try:
-                ui = load_json_file(user_info_path)
-                username = ui.get('data', {}).get('user', {}).get('username', creator_folder) or creator_folder
-            except Exception:
-                pass
+    if skip_gender:
+        print(f"\n{Fore.YELLOW}Skipping gender/age detection (--analyze mode).{Style.RESET_ALL}")
+    else:
+        print(f"\n{Fore.YELLOW}Phase 1: Detecting gender & age from profile images...{Style.RESET_ALL}")
 
-        result = detector.detect(username, local_dir=base_path)
+        detector = Detector()
 
-        if result['detection_status'] == 'Success':
-            status_str = (f"{result['gender']} ({result['gender_confidence']}%)  "
-                          f"age {result['age_group']} ({result['age_confidence']}%)")
-        else:
-            status_str = result['detection_status']
-        print(f"  [{idx+1}/{len(creators_to_analyze)}] {username}: {status_str}")
+        for idx, creator_folder in enumerate(tqdm(
+            creators_to_analyze,
+            desc=f"{Fore.GREEN}Gender detection{Style.RESET_ALL}",
+            unit=" creators"
+        )):
+            user_info_path = os.path.join(base_path, creator_folder, 'userInfo.json')
+            username = creator_folder
+            if os.path.exists(user_info_path):
+                try:
+                    ui = load_json_file(user_info_path)
+                    username = ui.get('data', {}).get('user', {}).get('username', creator_folder) or creator_folder
+                except Exception:
+                    pass
 
-        gender_lookup[username] = result
+            result = detector.detect(username, local_dir=base_path)
 
-    print(f"{Fore.GREEN}Gender detection complete for {len(gender_lookup)} creators.{Style.RESET_ALL}")
+            if result['detection_status'] == 'Success':
+                status_str = (f"{result['gender']} ({result['gender_confidence']}%)  "
+                              f"age {result['age_group']} ({result['age_confidence']}%)")
+            else:
+                status_str = result['detection_status']
+            print(f"  [{idx+1}/{len(creators_to_analyze)}] {username}: {status_str}")
 
-    # ── PHASE 2: Parallel analysis ────────────────────────────────────────────
-    print(f"\n{Fore.YELLOW}Phase 2: Starting parallel analysis...{Style.RESET_ALL}")
+            gender_lookup[username] = result
+
+        print(f"{Fore.GREEN}Gender detection complete for {len(gender_lookup)} creators.{Style.RESET_ALL}")
+
+    phase_label = "Analysis" if skip_gender else "Phase 2: Parallel analysis"
+    print(f"\n{Fore.YELLOW}{phase_label} starting...{Style.RESET_ALL}")
 
     all_analyzed_results    = []
     all_ai_analyzed_results = []
